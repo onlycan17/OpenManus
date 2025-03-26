@@ -7,6 +7,8 @@ from typing import Dict, List, Optional, Union
 from datetime import datetime
 from pydantic import BaseModel, Field
 
+from app.feedback.models import Feedback, FeedbackType, FeedbackSeverity
+
 class PlanCondition(BaseModel):
     """계획 실행 조건을 정의하는 클래스"""
 
@@ -59,6 +61,13 @@ class HierarchicalPlan(BaseModel):
     # 실행 통계
     execution_stats: ExecutionStats = Field(default_factory=ExecutionStats, description="실행 통계")
 
+    # 피드백 관련 필드 추가
+    feedback_ids: List[str] = Field(default_factory=list, description="관련 피드백들의 ID")
+    feedback_metrics: Dict[str, Union[int, float]] = Field(
+        default_factory=dict,
+        description="피드백 기반 메트릭"
+    )
+
     def add_child(self, child_id: str) -> None:
         """자식 계획 추가"""
         if child_id not in self.child_ids:
@@ -109,6 +118,44 @@ class HierarchicalPlan(BaseModel):
         else:
             raise IndexError(f"Step index {step_index} is out of range")
 
+    # 피드백 관련 메서드 추가
+    def add_feedback(self, feedback_id: str) -> None:
+        """피드백 추가"""
+        if feedback_id not in self.feedback_ids:
+            self.feedback_ids.append(feedback_id)
+
+    def remove_feedback(self, feedback_id: str) -> None:
+        """피드백 제거"""
+        if feedback_id in self.feedback_ids:
+            self.feedback_ids.remove(feedback_id)
+
+    def update_feedback_metrics(self, metrics: Dict[str, Union[int, float]]) -> None:
+        """피드백 메트릭 업데이트"""
+        self.feedback_metrics.update(metrics)
+
+    def get_feedback_metric(self, key: str) -> Optional[Union[int, float]]:
+        """특정 피드백 메트릭 조회"""
+        return self.feedback_metrics.get(key)
+
+    def create_execution_feedback(
+        self,
+        title: str,
+        description: str,
+        severity: FeedbackSeverity,
+        step_index: Optional[int] = None,
+        metrics: Optional[Dict[str, Union[int, float]]] = None
+    ) -> Dict:
+        """실행 관련 피드백 생성을 위한 데이터 준비"""
+        return {
+            "plan_id": self.id,
+            "type": FeedbackType.EXECUTION,
+            "severity": severity,
+            "title": title,
+            "description": description,
+            "step_index": step_index,
+            "metrics": metrics or {}
+        }
+
     def to_dict(self) -> Dict:
         """계획을 딕셔너리로 변환"""
         return {
@@ -122,5 +169,7 @@ class HierarchicalPlan(BaseModel):
             "step_notes": self.step_notes,
             "conditions": [condition.dict() for condition in self.conditions],
             "fallback_plan_ids": self.fallback_plan_ids,
-            "execution_stats": self.execution_stats.dict()
+            "execution_stats": self.execution_stats.dict(),
+            "feedback_ids": self.feedback_ids,
+            "feedback_metrics": self.feedback_metrics
         }

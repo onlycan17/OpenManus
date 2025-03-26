@@ -1,0 +1,20 @@
+[run]
+branch = True
+source = app/feedback
+
+[report]
+exclude_lines =
+    pragma: no cover
+    def __repr__
+    if self.debug:
+    raise NotImplementedError
+    if __name__ == .__main__.:
+    pass
+    raise ImportError
+    except ImportError:
+    if 0:
+    if False:
+
+[html]
+directory = coverage_html
+title = OpenManus Feedback System Test Coverage Report
