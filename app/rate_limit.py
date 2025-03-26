@@ -27,6 +27,15 @@ class RetryStats:
     success_streak: int = 0
 
 
+@dataclass
+class ServerStatus:
+    """서버 상태를 추적하는 데이터 클래스"""
+    last_check: datetime
+    is_overloaded: bool = False
+    error_count: int = 0
+    last_error_time: Optional[datetime] = None
+
+
 class RateLimitHandler:
     """Rate Limit을 관리하는 클래스"""
 
@@ -37,7 +46,9 @@ class RateLimitHandler:
         max_retries: int = 5,
         initial_backoff: float = 1.0,
         max_backoff: float = 60.0,
-        backoff_multiplier: float = 2.0
+        backoff_multiplier: float = 2.0,
+        max_concurrent: int = 5,
+        server_check_interval: int = 60
     ):
         """
         Args:
@@ -47,6 +58,8 @@ class RateLimitHandler:
             initial_backoff (float): 초기 대기 시간(초)
             max_backoff (float): 최대 대기 시간(초)
             backoff_multiplier (float): 대기 시간 증가 배수
+            max_concurrent (int): 최대 동시 요청 수
+            server_check_interval (int): 서버 상태 체크 주기(초)
         """
         self.tokens_per_minute = tokens_per_minute
         self.window_size = window_size
@@ -62,6 +75,69 @@ class RateLimitHandler:
         self.retry_stats: Dict[str, RetryStats] = {}
         self.usage_patterns: List[TokenUsage] = []
         self.peak_usage_times: List[datetime] = []
+
+        # 동시성 제어
+        self.concurrent_requests = 0
+        self.max_concurrent = max_concurrent
+        self._lock = asyncio.Lock()
+
+        # 서버 상태 모니터링
+        self.server_status = ServerStatus(last_check=datetime.now())
+        self.server_check_interval = server_check_interval
+
+    async def check_server_status(self) -> bool:
+        """서버 상태를 확인합니다.
+
+        Returns:
+            bool: 서버가 정상 상태이면 True
+        """
+        current_time = datetime.now()
+
+        # 마지막 체크로부터 일정 시간이 지났거나 에러가 발생한 경우에만 체크
+        if (current_time - self.server_status.last_check).seconds >= self.server_check_interval or \
+           self.server_status.is_overloaded:
+
+            # 에러 카운트 감소 (시간 경과에 따른 복구 고려)
+            time_since_error = None
+            if self.server_status.last_error_time:
+                time_since_error = (current_time - self.server_status.last_error_time).seconds
+                if time_since_error > 300:  # 5분 이상 지났으면
+                    self.server_status.error_count = max(0, self.server_status.error_count - 1)
+
+            self.server_status.last_check = current_time
+
+            # 서버 상태 판단
+            self.server_status.is_overloaded = (
+                self.server_status.error_count >= 3 or  # 3회 이상 에러
+                (time_since_error and time_since_error < 60)  # 1분 이내 에러 발생
+            )
+
+        return not self.server_status.is_overloaded
+
+    def record_error(self, error_code: int) -> None:
+        """에러를 기록합니다.
+
+        Args:
+            error_code (int): HTTP 에러 코드
+        """
+        if error_code == 529:  # 과부하 에러
+            self.server_status.is_overloaded = True
+            self.server_status.error_count += 1
+            self.server_status.last_error_time = datetime.now()
+            logger.warning(f"서버 과부하 감지 (에러 카운트: {self.server_status.error_count})")
+
+    async def wait_for_available_slot(self) -> None:
+        """사용 가능한 요청 슬롯을 기다립니다."""
+        async with self._lock:
+            while self.concurrent_requests >= self.max_concurrent:
+                logger.warning(f"동시 요청 제한에 도달. 현재: {self.concurrent_requests}/{self.max_concurrent}")
+                await asyncio.sleep(1)
+            self.concurrent_requests += 1
+
+    async def release_slot(self) -> None:
+        """요청 슬롯을 해제합니다."""
+        async with self._lock:
+            self.concurrent_requests = max(0, self.concurrent_requests - 1)
 
     def _cleanup_old_usage(self) -> None:
         """만료된 사용량 기록을 제거합니다."""
@@ -97,6 +173,9 @@ class RateLimitHandler:
         if not stats:
             return self.initial_backoff
 
+        # 서버 상태에 따른 백오프 증가
+        server_multiplier = 2.0 if self.server_status.is_overloaded else 1.0
+
         # 성공 스트릭에 따른 백오프 감소
         backoff_reduction = min(0.5, stats.success_streak * 0.1)
 
@@ -116,6 +195,9 @@ class RateLimitHandler:
         # 피크 시간대는 백오프 증가
         if is_peak_time:
             backoff *= 1.5
+
+        # 서버 상태에 따른 조정
+        backoff *= server_multiplier
 
         # 성공 스트릭에 따른 감소 적용
         backoff *= (1 - backoff_reduction)
@@ -147,18 +229,36 @@ class RateLimitHandler:
 
         while stats.retry_count <= self.max_retries:
             try:
-                result = await func(*args, **kwargs)
+                # 서버 상태 체크
+                if not await self.check_server_status():
+                    logger.warning("서버 과부하 상태, 잠시 대기...")
+                    await asyncio.sleep(5)
+                    continue
 
-                # 성공 시 통계 업데이트
-                stats.success_streak += 1
-                stats.retry_count = 0
-                stats.backoff_factor = 1.0
+                # 동시성 제어
+                await self.wait_for_available_slot()
 
-                return result
+                try:
+                    result = await func(*args, **kwargs)
+
+                    # 성공 시 통계 업데이트
+                    stats.success_streak += 1
+                    stats.retry_count = 0
+                    stats.backoff_factor = 1.0
+
+                    return result
+
+                finally:
+                    # 항상 슬롯 해제
+                    await self.release_slot()
 
             except Exception as e:
                 stats.retry_count += 1
                 stats.success_streak = 0
+
+                # 에러 코드 확인 및 기록
+                if hasattr(e, 'status_code'):
+                    self.record_error(e.status_code)
 
                 if stats.retry_count > self.max_retries:
                     logger.error(f"최대 재시도 횟수({self.max_retries})를 초과했습니다.")
