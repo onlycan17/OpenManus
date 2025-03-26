@@ -206,7 +206,7 @@ class LLM:
             self.api_version = llm_config.api_version
             self.base_url = llm_config.base_url
 
-            # Rate Limit Handler 초기화
+            # Initialize Rate Limit Handler
             self.rate_limit_handler = RateLimitHandler()
 
             # Add token counting related attributes
@@ -248,32 +248,30 @@ class LLM:
         return self.token_counter.count_message_tokens(messages)
 
     def update_token_count(self, input_tokens: int, completion_tokens: int = 0) -> None:
-        """Update token counts"""
-        # Only track tokens if max_input_tokens is set
+        """Update the total token counts"""
         self.total_input_tokens += input_tokens
         self.total_completion_tokens += completion_tokens
-        logger.info(
-            f"Token usage: Input={input_tokens}, Completion={completion_tokens}, "
-            f"Cumulative Input={self.total_input_tokens}, Cumulative Completion={self.total_completion_tokens}, "
-            f"Total={input_tokens + completion_tokens}, Cumulative Total={self.total_input_tokens + self.total_completion_tokens}"
-        )
 
-    def check_token_limit(self, input_tokens: int) -> bool:
-        """Check if token limits are exceeded"""
-        if self.max_input_tokens is not None:
-            return (self.total_input_tokens + input_tokens) <= self.max_input_tokens
-        # If max_input_tokens is not set, always return True
-        return True
+    async def _process_request(self, messages: List[dict], **kwargs):
+        try:
+            # Check Rate Limit and wait if needed
+            input_tokens = self.count_message_tokens(messages)
+            await self.rate_limit_handler.wait_if_needed(input_tokens)
 
-    def get_limit_error_message(self, input_tokens: int) -> str:
-        """Generate error message for token limit exceeded"""
-        if (
-            self.max_input_tokens is not None
-            and (self.total_input_tokens + input_tokens) > self.max_input_tokens
-        ):
-            return f"Request may exceed input token limit (Current: {self.total_input_tokens}, Needed: {input_tokens}, Max: {self.max_input_tokens})"
+            response = await self._make_request(messages, **kwargs)
 
-        return "Token limit exceeded"
+            # Record token usage
+            self.rate_limit_handler.record_usage(input_tokens)
+            return response
+
+        except Exception as e:
+            # Use smart retry logic with request ID
+            return await self.rate_limit_handler.smart_retry(
+                str(id(messages)),
+                self._make_request,
+                messages,
+                **kwargs
+            )
 
     @staticmethod
     def format_messages(
@@ -758,3 +756,20 @@ class LLM:
         except Exception as e:
             logger.error(f"Unexpected error in ask_tool: {e}")
             raise
+
+    def check_token_limit(self, input_tokens: int) -> bool:
+        """Check if token limits are exceeded"""
+        if self.max_input_tokens is not None:
+            return (self.total_input_tokens + input_tokens) <= self.max_input_tokens
+        # If max_input_tokens is not set, always return True
+        return True
+
+    def get_limit_error_message(self, input_tokens: int) -> str:
+        """Generate error message for token limit exceeded"""
+        if (
+            self.max_input_tokens is not None
+            and (self.total_input_tokens + input_tokens) > self.max_input_tokens
+        ):
+            return f"Request may exceed input token limit (Current: {self.total_input_tokens}, Needed: {input_tokens}, Max: {self.max_input_tokens})"
+
+        return "Token limit exceeded"
