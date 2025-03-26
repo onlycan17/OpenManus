@@ -29,6 +29,8 @@ from app.schema import (
     Message,
     ToolChoice,
 )
+from app.rate_limit import RateLimitHandler
+import time
 
 
 REASONING_MODELS = ["o1", "o3-mini"]
@@ -204,6 +206,9 @@ class LLM:
             self.api_version = llm_config.api_version
             self.base_url = llm_config.base_url
 
+            # Rate Limit Handler 초기화
+            self.rate_limit_handler = RateLimitHandler()
+
             # Add token counting related attributes
             self.total_input_tokens = 0
             self.total_completion_tokens = 0
@@ -363,7 +368,7 @@ class LLM:
         stop=stop_after_attempt(6),
         retry=retry_if_exception_type(
             (OpenAIError, Exception, ValueError)
-        ),  # Don't retry TokenLimitExceeded
+        ),
     )
     async def ask(
         self,
@@ -372,42 +377,22 @@ class LLM:
         stream: bool = True,
         temperature: Optional[float] = None,
     ) -> str:
-        """
-        Send a prompt to the LLM and get the response.
-
-        Args:
-            messages: List of conversation messages
-            system_msgs: Optional system messages to prepend
-            stream (bool): Whether to stream the response
-            temperature (float): Sampling temperature for the response
-
-        Returns:
-            str: The generated response
-
-        Raises:
-            TokenLimitExceeded: If token limits are exceeded
-            ValueError: If messages are invalid or response is empty
-            OpenAIError: If API call fails after retries
-            Exception: For unexpected errors
-        """
-        try:
-            # Check if the model supports images
+        async def _make_request():
             supports_images = self.model in MULTIMODAL_MODELS
 
-            # Format system and user messages with image support check
             if system_msgs:
                 system_msgs = self.format_messages(system_msgs, supports_images)
                 messages = system_msgs + self.format_messages(messages, supports_images)
             else:
                 messages = self.format_messages(messages, supports_images)
 
-            # Calculate input token count
             input_tokens = self.count_message_tokens(messages)
 
-            # Check if token limits are exceeded
+            # Rate Limit 체크 및 대기
+            await self.rate_limit_handler.wait_if_needed(input_tokens)
+
             if not self.check_token_limit(input_tokens):
                 error_message = self.get_limit_error_message(input_tokens)
-                # Raise a special exception that won't be retried
                 raise TokenLimitExceeded(error_message)
 
             params = {
@@ -424,7 +409,6 @@ class LLM:
                 )
 
             if not stream:
-                # Non-streaming request
                 response = await self.client.chat.completions.create(
                     **params, stream=False
                 )
@@ -432,14 +416,15 @@ class LLM:
                 if not response.choices or not response.choices[0].message.content:
                     raise ValueError("Empty or invalid response from LLM")
 
-                # Update token counts
+                # 토큰 사용량 기록
+                self.rate_limit_handler.record_usage(response.usage.prompt_tokens)
                 self.update_token_count(
                     response.usage.prompt_tokens, response.usage.completion_tokens
                 )
 
                 return response.choices[0].message.content
 
-            # Streaming request, For streaming, update estimated token count before making the request
+            self.rate_limit_handler.record_usage(input_tokens)
             self.update_token_count(input_tokens)
 
             response = await self.client.chat.completions.create(**params, stream=True)
@@ -452,12 +437,11 @@ class LLM:
                 completion_text += chunk_message
                 print(chunk_message, end="", flush=True)
 
-            print()  # Newline after streaming
+            print()
             full_response = "".join(collected_messages).strip()
             if not full_response:
                 raise ValueError("Empty response from streaming LLM")
 
-            # estimate completion tokens for streaming response
             completion_tokens = self.count_tokens(completion_text)
             logger.info(
                 f"Estimated completion tokens for streaming response: {completion_tokens}"
@@ -466,8 +450,12 @@ class LLM:
 
             return full_response
 
+        try:
+            # 스마트 재시도 로직 사용
+            request_id = f"ask_{time.time()}"
+            return await self.rate_limit_handler.smart_retry(request_id, _make_request)
+
         except TokenLimitExceeded:
-            # Re-raise token limit errors without logging
             raise
         except ValueError:
             logger.exception(f"Validation error")
@@ -490,7 +478,7 @@ class LLM:
         stop=stop_after_attempt(6),
         retry=retry_if_exception_type(
             (OpenAIError, Exception, ValueError)
-        ),  # Don't retry TokenLimitExceeded
+        ),
     )
     async def ask_with_images(
         self,
@@ -646,7 +634,7 @@ class LLM:
         stop=stop_after_attempt(6),
         retry=retry_if_exception_type(
             (OpenAIError, Exception, ValueError)
-        ),  # Don't retry TokenLimitExceeded
+        ),
     )
     async def ask_tool(
         self,
