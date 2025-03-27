@@ -174,3 +174,13 @@ OpenManus는 MetaGPT 기여자들에 의해 개발되었습니다. 이 에이전
   howpublished = {\url{https://github.com/mannaandpoem/OpenManus}},
 }
 ```
+
+//실제 사용 예시
+# 1. 프로젝트 분석 시작
+python main.py analyze --project-id your_project_id
+
+# 2. 개선사항 확인
+python main.py suggestions --project-id your_project_id
+
+# 3. 특정 개선사항 적용
+python main.py apply-suggestion --suggestion-id suggestion_id
